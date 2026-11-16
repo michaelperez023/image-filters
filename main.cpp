@@ -1,453 +1,276 @@
-/**
- * @file main.cpp
- * Computer Vision Assignment 2
- * Dr. Abid
- * @author Michael Perez
- */
+// main.cpp
+//
+// Command-line program for the filters in filters.h. It shows an image and
+// applies one of seven filters when a key from 1 to 7 is pressed or, with
+// --no-gui, writes all seven results and a grid of them.
+//
+// Michael Perez, CAP 4410 Computer Vision, Assignment 2, Florida Polytechnic
+// University (fall 2019). Command-line options and the headless mode added in 2026.
 
-#include "opencv2/imgproc.hpp"
-#include <iostream>
+#include "filters.h"
+
+#include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 
-using namespace cv;
-using namespace std;
+#include <exception>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <system_error>
+#include <vector>
 
-// Global variables
-const string image_name = "bicycle.bmp";
-const int windowSize = 7; // Must be 3, 5, or 7
-Mat image, editedImage, grayImage, imageX, imageY, sobel;
-double red = 0.0, green = 0.0, blue = 0.0;
-double sobmin, sobmax;
-char key;
-
-Mat applyKernel(Mat image, double kernelFilter[3][3])
+namespace
 {
-	Mat result;
-	image.copyTo(result);
-
-	for (int y = 1; y < image.rows - 2; y++)
+	struct Options
 	{
-		for (int x = 1; x < image.cols - 2; x++)
-		{
-			red = 0.0, green = 0.0, blue = 0.0;
-			for (int k = -1; k <= 1; k++)
-			{
-				for (int j = -1; j <= 1; j++)
-				{
-					red += image.at<Vec3b>(y + j, x + k)[0] * kernelFilter[j + 1][k + 1];
-					green += image.at<Vec3b>(y + j, x + k)[1] * kernelFilter[j + 1][k + 1];
-					blue += image.at<Vec3b>(y + j, x + k)[2] * kernelFilter[j + 1][k + 1];
-				}
-			}
+		std::string image = "bicycle.bmp";
+		std::string output_dir;  // where to write the result images; empty = do not write
+		int size = 3;            // window size: 3, 5 or 7
+		bool gui = true;
+	};
 
-			if (red > 255)
-				red = 255;
-			else if (red < 0)
-				red = 0;
-			if (green > 255)
-				green = 255;
-			else if (green < 0)
-				green = 0;
-			if (blue > 255)
-				blue = 255;
-			else if (blue < 0)
-				blue = 0;
-
-			result.at<Vec3b>(y, x)[0] = red;
-			result.at<Vec3b>(y, x)[1] = green;
-			result.at<Vec3b>(y, x)[2] = blue;
-		}
+	void PrintUsage(std::ostream& out, const char* program)
+	{
+		out << "Usage: " << program << " [options] [image]\n"
+		    << "\n"
+		    << "Applies seven box, Sobel and Gaussian filters to an image\n"
+		    << "(default: bicycle.bmp in the current directory).\n"
+		    << "\n"
+		    << "Options:\n"
+		    << "  --size N    window size: 3, 5 or 7 (default 3)\n"
+		    << "  --out DIR   write the result images to DIR\n"
+		    << "  --no-gui    do not open windows: write the seven results and a grid\n"
+		    << "              of them (to ./output unless --out is given) and exit\n"
+		    << "  -h, --help  show this message\n"
+		    << "\n"
+		    << "In the window, press 1 to 7 to apply a filter, s to change the window\n"
+		    << "size, and q or Esc to quit.\n";
 	}
-	return result;
+
+	bool ParseSize(const std::string& text, int& size)
+	{
+		if (text != "3" && text != "5" && text != "7")
+			return false;
+		size = text[0] - '0';
+		return true;
+	}
+
+	enum class ParseResult { Run, Help, Error };
+
+	ParseResult ParseArguments(int argc, char** argv, Options& options)
+	{
+		bool image_given = false;
+		for (int i = 1; i < argc; ++i)
+		{
+			const std::string arg = argv[i];
+			if (arg == "-h" || arg == "--help")
+				return ParseResult::Help;
+
+			if (arg == "--no-gui")
+			{
+				options.gui = false;
+			}
+			else if (arg == "--size")
+			{
+				if (i + 1 >= argc || !ParseSize(argv[i + 1], options.size))
+				{
+					std::cerr << "--size must be 3, 5 or 7\n";
+					return ParseResult::Error;
+				}
+				++i;
+			}
+			else if (arg == "--out")
+			{
+				if (i + 1 >= argc)
+				{
+					std::cerr << "--out needs a directory\n";
+					return ParseResult::Error;
+				}
+				options.output_dir = argv[++i];
+			}
+			else if (arg.size() > 1 && arg[0] == '-')
+			{
+				std::cerr << "Unknown option: " << arg << "\n";
+				return ParseResult::Error;
+			}
+			else if (image_given)
+			{
+				std::cerr << "Only one image can be given\n";
+				return ParseResult::Error;
+			}
+			else
+			{
+				options.image = arg;
+				image_given = true;
+			}
+		}
+		return ParseResult::Run;
+	}
+
+	bool CreateOutputDirectory(const std::string& dir)
+	{
+		std::error_code error;
+		std::filesystem::create_directories(dir, error);
+		if (error)
+		{
+			std::cerr << "Could not create " << dir << ": " << error.message() << "\n";
+			return false;
+		}
+		return true;
+	}
+
+	// Output files are named after the input image and the window size, for
+	// example bicycle_3x3_5_magnitude.png, so that runs with other images or
+	// sizes can share a directory.
+	std::string OutputPath(const Options& options, const std::string& suffix)
+	{
+		const std::string size = std::to_string(options.size);
+		const std::string stem = std::filesystem::path(options.image).stem().string();
+		const std::string name = stem + "_" + size + "x" + size + "_" + suffix + ".png";
+		return (std::filesystem::path(options.output_dir) / name).string();
+	}
+
+	bool WriteImage(const cv::Mat& image, const std::string& path)
+	{
+		// zlib level 6 gives files about a third smaller than OpenCV's default
+		// but is several times slower, so images over 4 megapixels are written
+		// with the default.
+		constexpr std::size_t kSmallImage = 4000000;  // pixels
+		std::vector<int> png_options;
+		if (image.total() <= kSmallImage)
+			png_options = {cv::IMWRITE_PNG_COMPRESSION, 6};
+		if (image.empty() || !cv::imwrite(path, image, png_options))
+		{
+			std::cerr << "Could not write " << path << "\n";
+			return false;
+		}
+		std::cout << "Wrote " << path << "\n";
+		return true;
+	}
+
+	// The largest difference, in grey levels, between two 8-bit images
+	double LargestDifference(const cv::Mat& a, const cv::Mat& b)
+	{
+		return cv::norm(a, b, cv::NORM_INF);
+	}
+
+	int RunHeadless(const cv::Mat& image, const Options& options)
+	{
+		const std::vector<filters::FilterInfo>& all = filters::AllFilters();
+		std::vector<cv::Mat> results;
+		for (const filters::FilterInfo& info : all)
+			results.push_back(filters::Apply(info.filter, image, options.size));
+
+		std::cout << "Largest difference between the own and OpenCV filters, in grey levels:\n"
+		          << "  box filter (keys 1 and 2):       " << LargestDifference(results[0], results[1]) << "\n"
+		          << "  Sobel magnitude (keys 5 and 6):  " << LargestDifference(results[4], results[5]) << "\n";
+
+		bool ok = true;
+		for (std::size_t i = 0; i < all.size(); ++i)
+			ok = WriteImage(results[i], OutputPath(options, all[i].suffix)) && ok;
+		ok = WriteImage(filters::MakeGrid(image, results, options.size), OutputPath(options, "grid")) && ok;
+		return ok ? 0 : 1;
+	}
+
+	int NextSize(int size)
+	{
+		return size == 3 ? 5 : size == 5 ? 7 : 3;
+	}
+
+	int RunGui(const cv::Mat& image, Options options)
+	{
+		const std::string window = "Image";
+		cv::namedWindow(window, cv::WINDOW_AUTOSIZE);
+		cv::imshow(window, image);
+		cv::waitKey(1);
+
+		// Not every backend reports whether a window is still open, so only
+		// watch for a closed window when the backend reports it as visible now.
+		const bool can_detect_close = cv::getWindowProperty(window, cv::WND_PROP_VISIBLE) >= 1;
+
+		std::cout << "Press 1 to 7 to apply a filter, s to change the window size (now "
+		          << options.size << "x" << options.size << "), q or Esc to quit." << std::endl;
+		const filters::FilterInfo* shown = nullptr;  // the filter in the "Edited Image" window
+		while (true)
+		{
+			const int key = cv::waitKey(50);
+			if (key == 'q' || key == 'Q' || key == 27)
+				break;
+			if (can_detect_close && cv::getWindowProperty(window, cv::WND_PROP_VISIBLE) < 1)
+				break;
+
+			const filters::FilterInfo* chosen = nullptr;
+			for (const filters::FilterInfo& info : filters::AllFilters())
+				if (key == info.key)
+					chosen = &info;
+			if (key == 's' || key == 'S')
+			{
+				options.size = NextSize(options.size);
+				std::cout << "Window size " << options.size << "x" << options.size << std::endl;
+				chosen = shown;  // show the last filter again with the new size
+			}
+			if (!chosen)
+				continue;
+
+			const cv::Mat result = filters::Apply(chosen->filter, image, options.size);
+			std::cout << chosen->key << ": " << chosen->name << ", window " << options.size << "x"
+			          << options.size << std::endl;
+			cv::imshow("Edited Image", result);
+			shown = chosen;
+			if (!options.output_dir.empty())
+				WriteImage(result, OutputPath(options, chosen->suffix));
+		}
+		cv::destroyAllWindows();
+		return 0;
+	}
 }
 
-Mat applyKernel(Mat image, double kernelFilter[5][5])
-{
-	Mat result;
-	image.copyTo(result);
-
-	for (int y = 2; y < image.rows - 3; y++)
-	{
-		for (int x = 2; x < image.cols - 3; x++)
-		{
-			red = 0.0, green = 0.0, blue = 0.0;
-			for (int k = -1; k <= 3; k++)
-			{
-				for (int j = -1; j <= 3; j++)
-				{
-					red += image.at<Vec3b>(y + j, x + k)[0] * kernelFilter[j + 1][k + 1];
-					green += image.at<Vec3b>(y + j, x + k)[1] * kernelFilter[j + 1][k + 1];
-					blue += image.at<Vec3b>(y + j, x + k)[2] * kernelFilter[j + 1][k + 1];
-				}
-			}
-
-			if (red > 255)
-				red = 255;
-			else if (red < 0)
-				red = 0;
-			if (green > 255)
-				green = 255;
-			else if (green < 0)
-				green = 0;
-			if (blue > 255)
-				blue = 255;
-			else if (blue < 0)
-				blue = 0;
-
-			result.at<Vec3b>(y, x)[0] = red;
-			result.at<Vec3b>(y, x)[1] = green;
-			result.at<Vec3b>(y, x)[2] = blue;
-		}
-	}
-	return result;
-}
-
-Mat applyKernel(Mat image, double kernelFilter[7][7])
-{
-	Mat result;
-	image.copyTo(result);
-
-	for (int y = 3; y < image.rows - 4; y++)
-	{
-		for (int x = 3; x < image.cols - 4; x++)
-		{
-			red = 0.0, green = 0.0, blue = 0.0;
-			for (int k = -1; k <= 5; k++)
-			{
-				for (int j = -1; j <= 5; j++)
-				{
-					red += image.at<Vec3b>(y + j, x + k)[0] * kernelFilter[j + 1][k + 1];
-					green += image.at<Vec3b>(y + j, x + k)[1] * kernelFilter[j + 1][k + 1];
-					blue += image.at<Vec3b>(y + j, x + k)[2] * kernelFilter[j + 1][k + 1];
-				}
-			}
-
-			if (red > 255)
-				red = 255;
-			else if (red < 0)
-				red = 0;
-			if (green > 255)
-				green = 255;
-			else if (green < 0)
-				green = 0;
-			if (blue > 255)
-				blue = 255;
-			else if (blue < 0)
-				blue = 0;
-
-			result.at<Vec3b>(y, x)[0] = red;
-			result.at<Vec3b>(y, x)[1] = green;
-			result.at<Vec3b>(y, x)[2] = blue;
-		}
-	}
-	return result;
-}
-
-/**
- * @function main
- */
 int main(int argc, char** argv)
 {
-	// Display windows
-	image = imread(image_name);
-	imshow("Image", image);
+	Options options;
+	switch (ParseArguments(argc, argv, options))
+	{
+	case ParseResult::Help:
+		PrintUsage(std::cout, argv[0]);
+		return 0;
+	case ParseResult::Error:
+		PrintUsage(std::cerr, argv[0]);
+		return 2;
+	case ParseResult::Run:
+		break;
+	}
+	if (!options.gui && options.output_dir.empty())
+		options.output_dir = "output";
 
+	const cv::Mat image = cv::imread(options.image, cv::IMREAD_COLOR);
 	if (image.empty())
 	{
-		cout << "The image could not be read. Exiting Program. ";
-		return -1;
+		std::cerr << "Could not read the image '" << options.image << "'.\n";
+		return 1;
 	}
+	std::cout << "Image: " << options.image << " (" << image.cols << "x" << image.rows << "), window size "
+	          << options.size << "x" << options.size << "\n";
 
-	// Main loop
-	while (1)
+	if (!options.output_dir.empty() && !CreateOutputDirectory(options.output_dir))
+		return 1;
+
+	try
 	{
-		key = waitKey(10); // Scan for key press every 10 ms
-
-		if (key == '1') // Apply the box filter that I coded myself
-		{
-			if (windowSize == 3)
-			{
-				double kernel[3][3] = {{1 / 9.0, 1 / 9.0, 1 / 9.0},
-									{1 / 9.0, 1 / 9.0, 1 / 9.0},
-									{1 / 9.0, 1 / 9.0, 1 / 9.0}};
-
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 5)
-			{
-				double kernel[5][5] = {{1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0},
-									{1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0},
-									{1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0},
-									{1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0},
-									{1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0, 1 / 25.0}};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 7)
-			{
-				double kernel[7][7] = {{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0},
-									{1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0, 1 / 49.0,  1 / 49.0,  1 / 49.0}};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-		}
-
-		if (key == '2') // Apply the OpenCV box filter
-		{
-			boxFilter(image, editedImage, -1, Size(windowSize,windowSize), Point(-1,-1), true, BORDER_DEFAULT);
-			imshow("Edited Image", editedImage);
-		}
-
-		if (key == '3') // Apply the Sobel filter towards x-axis edges that I coded myself to image
-		{
-			if (windowSize == 3)
-			{
-				double kernel[3][3] = {{-1, -2, -1},
-									{0, 0, 0},
-									{1, 2, 1}};
-
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 5)
-			{
-				double kernel[5][5] = {{-2, -3, -4, -3, -2},
-									{-1, -2, -3, -2, -1},
-									{0, 0, 0, 0, 0},
-									{1, 2, 3, 2, 1},
-									{2, 3, 4, 3, 2}};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 7)
-			{
-				double kernel[7][7] = {{-3, -4, -5, -6, -5, -4, -3},
-									{-2, -3, -4, -5, -4, -3, -2},
-									{-1, -2, -3, -4, -3, -2, -1},
-									{0, 0, 0, 0, 0, 0, 0},
-									{1, 2, 3, 4, 3, 2, 1},
-									{2, 3, 4, 5, 4, 3, 2},
-									{3, 4, 5, 6, 5, 4, 3}};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-		}
-
-		if (key == '4') // Apply the Sobel filter towards y-axis edges that I coded myself to image
-		{
-			if (windowSize == 3)
-			{
-				double kernel[3][3] = {
-				{-1, 0, 1},
-				{-2, 0, 2},
-				{-1, 0, 1}};
-
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 5)
-			{
-				double kernel[5][5] = {
-									{2, 1, 0, -1, -2},
-									{3, 2, 0, -2, -3},
-									{4, 3, 0, -3, -4},
-									{3, 2, 0, -2, -3},
-									{2, 1, 0, -1, -2}
-				};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 7)
-			{
-				double kernel[7][7] = {
-									{3, 2, 1, 0, -1, -2, -3},
-									{4, 3, 2, 0, -2, -3, -4},
-									{5, 4, 3, 0, -3, -4, -5},
-									{6, 5, 4, 0, -4, -5, -6},
-									{5, 4, 3, 0, -3, -4, -5},
-									{4, 3, 2, 0, -2, -3, - 4},
-									{3, 2, 1, 0, -1, -2, -3}
-				};
-				editedImage = applyKernel(image, kernel);
-				imshow("Edited Image", editedImage);
-			}
-		}
-
-		if (key == '5') // Apply the Sobel filter towards x=axis and y-axis edges that I coded myself to image
-		{
-			if (windowSize == 3)
-			{
-				image.copyTo(editedImage);
-				double kernel1[3][3] = {{-1, -2, -1},
-										{0, 0, 0},
-										{1, 2, 1}};
-
-				double kernel2[3][3] = {{-1, 0, 1},
-										{-2, 0, 2},
-										{-1, 0, 1}};
-
-				imageX = applyKernel(image, kernel1);
-				imageY = applyKernel(image, kernel2);
-
-				for (int y = 1; y < image.rows - 2; y++)
-				{
-					for (int x = 1; x < image.cols - 2; x++)
-					{
-						red = sqrt(pow(imageX.at<Vec3b>(y, x)[0], 2) + pow(imageY.at<Vec3b>(y, x)[0], 2));
-						green = sqrt(pow(imageX.at<Vec3b>(y, x)[1], 2) + pow(imageY.at<Vec3b>(y, x)[1], 2));
-						blue = sqrt(pow(imageX.at<Vec3b>(y, x)[2], 2) + pow(imageY.at<Vec3b>(y, x)[2], 2));
-
-						if (red > 255)
-							red = 255;
-						else if (red < 0)
-							red = 0;
-						if (green > 255)
-							green = 255;
-						else if (green < 0)
-							green = 0;
-						if (blue > 255)
-							blue = 255;
-						else if (blue < 0)
-							blue = 0;
-
-						editedImage.at<Vec3b>(y, x)[0] = red;
-						editedImage.at<Vec3b>(y, x)[1] = green;
-						editedImage.at<Vec3b>(y, x)[2] = blue;
-					}
-				}
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 5)
-			{
-				image.copyTo(editedImage);
-				double kernel1[5][5] = {{-2, -3, -4, -3, -2},
-									{-1, -2, -3, -2, -1},
-									{0, 0, 0, 0, 0},
-									{1, 2, 3, 2, 1},
-									{2, 3, 4, 3, 2}};
-
-				double kernel2[5][5] = {{2, 1, 0, -1, -2},
-									{3, 2, 0, -2, -3},
-									{4, 3, 0, -3, -4},
-									{3, 2, 0, -2, -3},
-									{2, 1, 0, -1, -2}};
-
-				imageX = applyKernel(image, kernel1);
-				imageY = applyKernel(image, kernel2);
-
-				for (int y = 1; y < image.rows - 2; y++)
-				{
-					for (int x = 1; x < image.cols - 2; x++)
-					{
-						red = sqrt(pow(imageX.at<Vec3b>(y, x)[0], 2) + pow(imageY.at<Vec3b>(y, x)[0], 2));
-						green = sqrt(pow(imageX.at<Vec3b>(y, x)[1], 2) + pow(imageY.at<Vec3b>(y, x)[1], 2));
-						blue = sqrt(pow(imageX.at<Vec3b>(y, x)[2], 2) + pow(imageY.at<Vec3b>(y, x)[2], 2));
-
-						if (red > 255)
-							red = 255;
-						else if (red < 0)
-							red = 0;
-						if (green > 255)
-							green = 255;
-						else if (green < 0)
-							green = 0;
-						if (blue > 255)
-							blue = 255;
-						else if (blue < 0)
-							blue = 0;
-
-						editedImage.at<Vec3b>(y, x)[0] = red;
-						editedImage.at<Vec3b>(y, x)[1] = green;
-						editedImage.at<Vec3b>(y, x)[2] = blue;
-					}
-				}
-				imshow("Edited Image", editedImage);
-			}
-			else if (windowSize == 7)
-			{
-				image.copyTo(editedImage);
-				double kernel1[7][7] = { {-3, -4, -5, -6, -5, -4, -3},
-									{-2, -3, -4, -5, -4, -3, -2},
-									{-1, -2, -3, -4, -3, -2, -1},
-									{0, 0, 0, 0, 0, 0, 0},
-									{1, 2, 3, 4, 3, 2, 1},
-									{2, 3, 4, 5, 4, 3, 2},
-									{3, 4, 5, 6, 5, 4, 3} };
-				
-				double kernel2[7][7] = {{3, 2, 1, 0, -1, -2, -3},
-									{4, 3, 2, 0, -2, -3, -4},
-									{5, 4, 3, 0, -3, -4, -5},
-									{6, 5, 4, 0, -4, -5, -6},
-									{5, 4, 3, 0, -3, -4, -5},
-									{4, 3, 2, 0, -2, -3, -4},
-									{3, 2, 1, 0, -1, -2, -3}};
-
-				imageX = applyKernel(image, kernel1);
-				imageY = applyKernel(image, kernel2);
-
-				for (int y = 1; y < image.rows - 2; y++)
-				{
-					for (int x = 1; x < image.cols - 2; x++)
-					{
-						red = sqrt(pow(imageX.at<Vec3b>(y, x)[0], 2) + pow(imageY.at<Vec3b>(y, x)[0], 2));
-						green = sqrt(pow(imageX.at<Vec3b>(y, x)[1], 2) + pow(imageY.at<Vec3b>(y, x)[1], 2));
-						blue = sqrt(pow(imageX.at<Vec3b>(y, x)[2], 2) + pow(imageY.at<Vec3b>(y, x)[2], 2));
-
-						if (red > 255)
-							red = 255;
-						else if (red < 0)
-							red = 0;
-						if (green > 255)
-							green = 255;
-						else if (green < 0)
-							green = 0;
-						if (blue > 255)
-							blue = 255;
-						else if (blue < 0)
-							blue = 0;
-
-						editedImage.at<Vec3b>(y, x)[0] = red;
-						editedImage.at<Vec3b>(y, x)[1] = green;
-						editedImage.at<Vec3b>(y, x)[2] = blue;
-					}
-				}
-				imshow("Edited Image", editedImage);
-			}
-		}
-
-		if (key == '6')  // Apply the Sobel filter towards x=axis and y-axis edges (OpenCV) to image
-		{
-			// Convert the image to grayscale
-			cvtColor(image, grayImage, COLOR_BGR2GRAY);
-
-			// Generate grad_x and grad_y
-			Mat grad_x, grad_y;
-
-			// Gradient X
-			Sobel(grayImage, imageX, CV_16S, 1, 0, windowSize, 10, 10, BORDER_DEFAULT);
-
-			// Gradient Y
-			Sobel(grayImage, imageY, CV_16S, 0, 1, windowSize, 10, 10, BORDER_DEFAULT);
-
-			sobel = abs(imageX) + abs(imageY);
-			
-			minMaxLoc(sobel, &sobmin, &sobmax);
-			sobel.convertTo(editedImage, CV_8U, 255. / sobmax, 0);
-
-			imshow("Edited Image", editedImage);
-		}
-
-		if (key == '7') // Apply Gaussian Filter (OpenCV) to image
-		{
-			GaussianBlur(image, editedImage, Size(windowSize, windowSize), 0, 0, BORDER_DEFAULT);
-			imshow("Edited Image", editedImage);
-		}
+		if (!options.gui)
+			return RunHeadless(image, options);
+		return RunGui(image, options);
 	}
-	return 0;
+	catch (const cv::Exception& e)
+	{
+		std::cerr << "OpenCV error: " << e.what() << "\n";
+		if (options.gui)
+			std::cerr << "To run without windows, use --no-gui.\n";
+		return 1;
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "Error: " << e.what() << "\n";
+		return 1;
+	}
 }
