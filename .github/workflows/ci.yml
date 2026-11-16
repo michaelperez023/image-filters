@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenCV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopencv-dev
+
+      # CMakeLists.txt adds -Wall -Wextra; warnings fail the build here.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run on the sample images
+        run: |
+          for image in bicycle.bmp dog.bmp edge_L-150x150.png south_L-150x150.png; do
+            for size in 3 5 7; do
+              ./build/filters --no-gui --size "$size" --out output "$image"
+            done
+          done
